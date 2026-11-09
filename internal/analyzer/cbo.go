@@ -443,6 +443,9 @@ func (a *CBOAnalyzer) analyzeInstantiationAndAccess(classNode *parser.Node, depe
 				a.addDependency(dependencies, dep, dependencyKindInstantiation)
 			}
 			// Note: function calls are NOT added to dependencies
+			// An isinstance/issubclass check betrays a runtime class dependency even
+			// when the class is only spelled by its bare imported name (see #884).
+			a.analyzeTypeCheckArguments(node, dependencies, include)
 		case parser.NodeAttribute:
 			// Attribute access: obj.method() or obj.attr
 			if a.shouldSkipAttributeAccess(node) {
@@ -473,6 +476,97 @@ func (a *CBOAnalyzer) analyzeInstantiationAndAccess(classNode *parser.Node, depe
 		}
 		return true
 	})
+}
+
+// analyzeTypeCheckArguments counts the class references in the second argument
+// of an isinstance/issubclass call. These are runtime dependencies on the
+// class, not annotations: a class imported by bare name must count exactly
+// like its dotted spelling, which the attribute-access path already covers.
+// Dotted arguments are therefore skipped here to avoid double counting.
+// Builtin types and ALL_CAPS constant tuples (NUMERIC_TYPES) never count.
+func (a *CBOAnalyzer) analyzeTypeCheckArguments(
+	callNode *parser.Node,
+	dependencies *cboDependencies,
+	include func(*parser.Node, string) bool,
+) {
+	if callNode == nil || len(callNode.Args) < 2 {
+		return
+	}
+	callee := a.extractClassNameFromCallNode(callNode)
+	if callee != "isinstance" && callee != "issubclass" {
+		return
+	}
+	for _, dep := range a.typeCheckArgumentClassNames(callNode.Args[1]) {
+		if include(callNode, dep) {
+			a.addDependency(dependencies, dep, dependencyKindAttributeAccess)
+		}
+	}
+}
+
+// typeCheckArgumentClassNames returns the class names a type-check argument
+// names: a single bare name or the bare names inside a tuple.
+func (a *CBOAnalyzer) typeCheckArgumentClassNames(arg *parser.Node) []string {
+	if arg == nil {
+		return nil
+	}
+	switch arg.Type {
+	case parser.NodeName:
+		if name := a.bareTypeCheckClassName(arg.Name); name != "" {
+			return []string{name}
+		}
+	case parser.NodeTuple:
+		names := make([]string, 0, len(arg.Children))
+		for _, child := range arg.Children {
+			if child == nil || child.Type != parser.NodeName {
+				continue
+			}
+			if name := a.bareTypeCheckClassName(child.Name); name != "" {
+				names = append(names, name)
+			}
+		}
+		return names
+	}
+	return nil
+}
+
+// bareTypeCheckClassName validates a bare name for the type-check path and
+// returns it as written: the analyzer keeps every imported reference in the
+// form the source spells it in (a bare import stays bare, a dotted name stays
+// dotted), so the isinstance form can never double count the dotted spelling.
+// Non-imported names are left to the same-file rules, ALL_CAPS constants and
+// builtin types are never classes.
+func (a *CBOAnalyzer) bareTypeCheckClassName(name string) string {
+	if name == "" || a.builtinTypes[name] || a.builtinFunctions[name] {
+		return ""
+	}
+	resolved := a.resolveImportedName(name)
+	if resolved == name {
+		// A locally defined class or an unresolved name; same-file coupling is
+		// decided elsewhere, so a type check alone does not count here.
+		return ""
+	}
+	if isAllCapsConstantName(resolved) || !looksLikeClassName(resolved) {
+		return ""
+	}
+	return name
+}
+
+// isAllCapsConstantName reports whether the leaf of a resolved name is an
+// ALL_CAPS constant, the shape used for tuples like NUMERIC_TYPES that should
+// never be mistaken for a class.
+func isAllCapsConstantName(name string) bool {
+	leaf := strings.TrimLeft(dependencyLeafName(name), "_")
+	hasLetter := false
+	for _, r := range leaf {
+		if !unicode.IsLetter(r) {
+			continue
+		}
+		hasLetter = true
+		if !unicode.IsUpper(r) {
+			return false
+		}
+	}
+	return hasLetter
 }
 
 // Helper methods

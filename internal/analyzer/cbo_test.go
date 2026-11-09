@@ -1976,3 +1976,68 @@ class Passed:
 		assert.Equal(t, 1, result.CouplingCount, "unexpected CBO for %s", className)
 	}
 }
+
+func TestCBOAnalyzer_BareClassReferenceInTypeCheck(t *testing.T) {
+	pythonCode := `
+from p.m import Bar, Foo
+from p.m import Foo as Aliased
+from p.m import NUMERIC_TYPES
+
+class BareCheck:
+    def check(self, x):
+        return isinstance(x, Foo)
+
+class BareTuple:
+    def check(self, x):
+        return isinstance(x, (Foo, Bar))
+
+class BareSubclass:
+    def check(self, x):
+        return issubclass(x, Foo)
+
+class AliasedCheck:
+    def check(self, x):
+        return isinstance(x, Aliased)
+
+class BuiltinCheck:
+    def check(self, x):
+        return isinstance(x, str)
+
+class ConstantTupleCheck:
+    def check(self, x):
+        return isinstance(x, NUMERIC_TYPES)
+
+class LocalOnly:
+    def check(self, x):
+        return isinstance(x, Peer)
+
+class Peer:
+    pass
+`
+
+	ast, err := parseCode(pythonCode)
+	require.NoError(t, err)
+
+	results, err := NewCBOAnalyzer(DefaultCBOOptions()).AnalyzeClasses(ast, "user.py")
+	require.NoError(t, err)
+
+	resultMap := make(map[string]*CBOResult)
+	for _, result := range results {
+		resultMap[result.ClassName] = result
+	}
+
+	for className, want := range map[string][]string{
+		"BareCheck":          {"Foo"},
+		"BareTuple":          {"Bar", "Foo"},
+		"BareSubclass":       {"Foo"},
+		"AliasedCheck":       {"Aliased"},
+		"BuiltinCheck":       {},
+		"ConstantTupleCheck": {},
+		"LocalOnly":          {},
+	} {
+		result := resultMap[className]
+		require.NotNil(t, result, "class %s not found", className)
+		assert.ElementsMatch(t, want, result.DependentClasses, "unexpected dependencies for %s", className)
+		assert.Equal(t, len(want), result.CouplingCount, "unexpected CBO for %s", className)
+	}
+}
